@@ -1,103 +1,134 @@
 # Ihsan Payments Lab
 
-Two isolated browser clients use the same Next.js TypeScript backend and Supabase PostgreSQL database. Each account has its own Privy embedded Solana wallet. An application-owned fee payer sponsors the transaction; the user signs the transfer in their browser. A funded test treasury provides Circle devnet USDC.
+A working reference implementation of messaging and wallet payments on Solana Devnet. Two browser clients share a Next.js backend while keeping separate Supabase sessions and Privy embedded wallets.
 
-## Start here
+Users can register, send messages, request test USDC and transfer it to another username inside a conversation. The application sponsors network fees; the user's wallet signs the transfer.
 
+[Open the application](https://ihsan-pay-lab.vercel.app/)
+
+## Try it
+
+Open the application on desktop to see both phones side by side.
+
+1. Create an account on the right phone. Wallet setup starts automatically; approve the ownership request if prompted.
+2. Open **Profile** and select **Add 3 test USDC**. Wait for the balance to update.
+3. Open **Chats**, choose the existing account and send a message. It appears on the left phone.
+4. Send **1 USDC** from the conversation and approve the transaction.
+5. Open **Activity** to inspect the receipt, transaction status and explorer link.
+
+The system tab provides a read-only view of accounts, payments, webhook events and reconciliation runs. All funds in this application are test tokens.
+
+## Stack
+
+| Layer | Technology |
+| --- | --- |
+| Application and API | Next.js, TypeScript |
+| Database and authentication | Supabase PostgreSQL, Auth, Realtime |
+| Embedded wallets | Privy with Supabase JWT authentication |
+| Transfers | Solana Devnet, Circle test USDC |
+| Transaction notifications | Helius webhooks |
+| Scheduled reconciliation | Supabase Cron |
+| Hosting | Vercel |
+
+## Payment flow
+
+```mermaid
+flowchart TD
+  Client["Browser · Privy wallet"] -->|Prepare payment| API["Next.js API"]
+  API -->|Reserve amount and store transaction| DB["PostgreSQL"]
+  API -->|Return transaction for signing| Client
+  Client -->|Submit signed transaction| API
+  API -->|Broadcast stored bytes| Chain["Solana Devnet"]
+  Chain -->|Transaction notification| Inbox["Helius webhook inbox"]
+  Inbox --> Worker["RPC reconciliation"]
+  Cron["Supabase Cron"] --> Worker
+  Worker -->|Verify finality and settle| DB
+```
+
+### Preparation and signing
+
+A payment starts with a client-generated idempotency key. PostgreSQL reserves the outgoing amount so concurrent requests cannot spend the same available balance through the application.
+
+The sponsor signs the prepared transaction first. Its fee-payer signature fixes the transaction ID before the transaction reaches the user's wallet. Preparation uses a conditional database update so competing requests return the stored transaction.
+
+The user signs that transaction in the browser. On submission, the backend verifies the signatures and checks that the transaction message matches the prepared message, including the recipient, amount, instructions, fee payer and blockhash. Signed bytes are stored before broadcast. Retries send the same bytes with the same transaction ID.
+
+### Confirmation and accounting
+
+Helius notifications are authenticated, deduplicated and stored before acknowledgment. They trigger reconciliation; settlement depends on a finalized RPC transaction matching the stored message. Supabase Cron also checks pending payments when a callback is delayed or missed.
+
+Each finalized payment produces two balanced, append-only ledger entries. Repeated settlement requests do not create additional entries.
+
+The normal payment lifecycle is:
+
+```text
+draft → prepared → submitted → finalized
+```
+
+Finalized chain errors mark a payment as `failed`. A prepared or submitted transaction can become `expired` after its validity window passes, with a 32-block safety margin and repeated checks for an on-chain result. Abandoned unsigned drafts expire after five minutes.
+
+## Local setup
+
+Requires **Node.js 22.12 or newer**. Dependencies are pinned in `package-lock.json`.
 
 ```bash
-cp .env.example .env.local
 npm ci
-# Fill environment, apply supabase/migrations/001_initial.sql, configure Privy.
+cp .env.example .env.local
+```
+
+Configure the values in `.env.local`, apply `supabase/migrations/001_initial.sql` and set up Privy's Supabase JWT authentication. Then run:
+
+```bash
 npm run wallet:create
 npm run seed
 npm run setup:check
 npm run dev
 ```
 
-Runtime: Node.js 22.12+ (24 LTS recommended). Package versions are locked in `package-lock.json`. `PRIVY_APP_SECRET` is not required by this design; all user-wallet signing is client-side. Do not copy secrets into source files.
+The wallet script generates the sponsor and test treasury keypairs. Add those values to your environment and fund the addresses on Devnet before running the setup check. Never commit `.env.local` or keypair secrets. `PRIVY_APP_SECRET` is not used by this implementation; user-wallet signing happens in the client.
 
-## Implemented
+See [KURULUM.tr.md](KURULUM.tr.md) for the full setup walkthrough, including provider configuration, webhook registration and the cron job.
 
-- Username/password registration with Supabase Auth, immutable username-to-wallet mapping and signed wallet ownership challenge.
-- Official Privy custom JWT authentication using Supabase asymmetric Auth signing keys.
-- Per-user embedded Solana wallets and user-authorized signatures. No server-side user-wallet signer or delegated wallet access.
-- Two isolated phone documents with independent authentication, chat, profile, funding and activity tabs.
-- Realtime chat through Supabase Realtime with participant RLS; payment and balance snapshots refresh on an eight-second fallback interval.
-- Test-USDC treasury grants; per-account daily limits and database-backed IP/request limits.
-- Integer token amounts, serialized outgoing reservations, idempotent payment preparation and immutable transaction messages.
-- Fee and associated token-account rent sponsorship by a separate application keypair.
-- Durable signed-transaction storage **before** broadcast. Uncertain submissions retry the exact bytes/signature.
-- Authenticated Helius devnet webhook inbox, post-response verification, and independent scheduled reconciliation.
-- Finalized RPC transaction/message verification before accounting, terminal failure/expiry states.
-- Exactly two balanced append-only journal entries per finalized payment.
-- Receipt detail with addresses, signature, slot, timestamps and devnet explorer link.
-- Wallet export through Privy's own UI. Private keys are not returned to the application.
-- Curated, read-only public observability view; it deliberately exposes only this demo's public accounts/payments, never messages, passwords or service keys.
+### Browser session isolation
 
-## Architecture
+The phones use different origins because Privy stores browser authentication by origin. Locally, use `localhost:3000` and `127.0.0.1:3000`. On Vercel, use two stable hostnames pointing to the same deployment. Allow both origins in Privy and the application's origin and frame policies.
 
-```mermaid
-flowchart TD
-  A["Phone A: Privy + Supabase session"] --> C["Next.js payment API"]
-  B["Phone B: Privy + Supabase session"] --> C
-  C --> D["Supabase PostgreSQL"]
-  C --> E["Solana Devnet RPC"]
-  E --> F["Helius webhook"]
-  F --> G["Durable webhook inbox"]
-  G --> H["RPC reconciliation"]
-  I["Supabase Cron"] --> H
-  H --> D
-```
-
-Payment lifecycle:
-
-`draft → prepared → submitted → finalized`
-
-`prepared/submitted → expired` only after the finalized block height passes the stored validity height plus a 32-block safety margin **and** repeat signature/transaction lookups are absent. A finalized chain rejection leads to `failed`. An abandoned unsigned draft can expire after five minutes. There is intentionally no “cancel already broadcast” endpoint.
-
-### Fixed transaction identity
-
-The sponsor signs first during preparation. Because the sponsor is the fee payer, its signature is the network transaction ID. That signature and serialized transaction are committed with compare-and-set before the bytes are handed to the client. A racing preparation cannot return its losing transaction. The client signs the stored message. Submission rejects missing signatures or any change to recipients, amount, instructions, fee payer or blockhash. The same intent is never silently rebuilt after an ambiguous broadcast.
-
-Client idempotency identifies a payment **intent**. Deliberately creating a new intent represents a new payment; the application cannot infer that two intentional payments were a mistake.
-
-### Webhooks are hints, not settlement authority
-
-The Helius auth header is constant-time compared with a server secret. Events are validated, size/batch limited and deduplicated by transaction signature. Accepted events are stored before acknowledgment. `after()` starts a bounded verification pass; the cron job handles missed/failed callbacks and incomplete submissions. A webhook cannot credit funds merely by claiming an amount or success. Only a finalized RPC transaction matching the stored message can call SQL settlement.
-
-`received_at` records first receipt; repeated callbacks do not reset the event or post another journal. Untracked signatures are marked `untracked`. This implementation reconciles **application-created payments and faucet grants**. It is not a general-purpose external-deposit indexer; external token transfers can affect the observed balance without appearing as an app receipt/journal entry.
-
-### Two clients, one deployment
-
-Privy persists browser authentication by origin. Two providers inside same-origin divs are not an adequate isolation boundary. The left iframe therefore uses a second hostname/alias for the same application. Locally use `localhost:3000` and `127.0.0.1:3000`; on Vercel use two stable public aliases/deployments with matching environment variables. Both are allowed in Privy and the application's frame-ancestor/origin rules. No additional VPS is required. Open the phones separately if the browser blocks a wallet flow inside an iframe.
-
-The shared host account is deliberately publicly accessible when enabled. It contains only test tokens. Guests' sessions are in memory and do not persist through a reload; they can sign in again. Privy's own SDK manages its separate encrypted wallet/auth state.
+Guest Supabase sessions are held in memory, so guests sign in again after a reload. The optional shared host account is public and should hold test tokens only.
 
 ## API
 
-All user endpoints use `Authorization: Bearer <Supabase access token>`. JSON mutations additionally require an allowlisted browser Origin. Webhooks/jobs use their own secrets. Mobile applications can use the same business endpoints after adding an explicit mobile-client origin/auth policy; do not remove the browser-origin check globally.
+Account endpoints require a Supabase bearer token. Browser POST requests also require an allowed `Origin`. Authentication endpoints establish the session; webhooks and scheduled jobs use separate secrets.
 
-| Endpoint | Method | Purpose |
+| Method | Endpoint | Description |
 | --- | --- | --- |
-| `/api/auth/register` | POST | Username, password, optional displayName |
-| `/api/auth/login` | POST | Username/password login |
-| `/api/auth/demo` | POST | Opt-in shared host session |
-| `/api/snapshot` | GET | Current profile, contacts, messages, receipts, on-chain balance |
-| `/api/wallet/challenge` | POST | Short-lived per-account ownership challenge |
-| `/api/wallet/bind` | POST | Verify Ed25519 challenge signature; bind once |
-| `/api/messages` | POST | Participant message with client UUID |
-| `/api/payments/prepare` | POST | Reserve amount and persist a sponsored transaction |
-| `/api/payments/submit` | POST | Verify signed message; persist before broadcast |
-| `/api/payments/reconcile` | POST | Rate-limited check of caller's pending payments |
-| `/api/faucet` | POST | Idempotent capped grant of test USDC |
-| `/api/webhooks/helius` | POST | Raw/enhanced devnet transaction notifications |
-| `/api/jobs/reconcile` | POST | Secret-authenticated scheduled reconciliation |
-| `/api/system` | GET | Curated public demo observability, read-only |
+| POST | `/api/auth/register` | Create an account |
+| POST | `/api/auth/login` | Sign in |
+| POST | `/api/auth/demo` | Open the shared host session when enabled |
+| GET | `/api/snapshot` | Profile, contacts, messages, payments and balance |
+| POST | `/api/wallet/challenge` | Request a wallet ownership challenge |
+| POST | `/api/wallet/bind` | Verify the challenge signature and bind the wallet |
+| POST | `/api/messages` | Send a message |
+| POST | `/api/payments/prepare` | Reserve funds and prepare a sponsored transfer |
+| POST | `/api/payments/submit` | Validate and submit the signed transaction |
+| POST | `/api/payments/reconcile` | Check the caller's pending payments |
+| POST | `/api/faucet` | Request a rate-limited test USDC grant |
+| POST | `/api/webhooks/helius` | Receive transaction notifications |
+| POST | `/api/jobs/reconcile` | Run scheduled reconciliation |
+| GET | `/api/system` | Read public test activity |
 
-Example prepare body: `{"recipientId":"<UUID>","amount":"5","key":"<UUID>"}`. Amounts travel as strings; arithmetic uses bigint and six decimal base units. The API returns a transaction for the user's wallet to sign, **not** a user private key.
+Example payment preparation request:
 
-## Validation
+```json
+{
+  "recipientId": "<recipient UUID>",
+  "amount": "1",
+  "key": "<request UUID>"
+}
+```
+
+Amounts are strings in API requests and integer base units internally, with six decimal places for USDC. The response contains the transaction for the wallet to sign.
+
+## Tests
 
 ```bash
 npm run typecheck
@@ -105,30 +136,30 @@ npm test
 npm run build
 ```
 
-Tests cover amount precision/rejection, transaction message tampering/missing signatures, webhook normalization, and real PostgreSQL invariants via PGlite. SQL tests execute the migration's tables, constraints and functions; only Supabase platform publication/extension setup is stubbed. They verify duplicate intents, mismatched idempotency requests, outgoing reservations, faucet limits, duplicate settlement, balanced entries and ledger immutability. They do not substitute for testing live Supabase Auth/Realtime, Privy, Helius or Solana.
+The test suite covers amount precision, transaction tampering, missing signatures, webhook normalization and payment recovery. Database tests use PGlite to execute the migration's PostgreSQL tables, constraints and functions, with Supabase-specific platform setup stubbed.
 
-## Intentional boundaries
+Database cases include duplicate requests, conflicting idempotency keys, concurrent outgoing reservations, faucet limits, repeated settlement and ledger immutability. Live provider configuration and browser wallet flows need separate integration testing. See [docs/VALIDATION.md](docs/VALIDATION.md) for the recorded validation scope.
 
-- This is a reviewable development implementation, not an independently audited payment product.
-- No bank rails, KYC/KYB, card issuing, merchant checkout or full messenger implementation. No fake “bank deposits” or KYC approvals.
-- No custom smart contract is necessary for ordinary SPL transfers. No token creation or DeFi integration.
-- Authentication uses synthetic demo email aliases, so email recovery is not available. A production identity/recovery design must replace this.
-- Supabase custom JWT auth is an identity trust root. Avoiding raw key storage and delegated server signers does **not** prove the operator cannot impersonate a user if that root is compromised. Independently enforced user recovery/MFA and a reviewed Privy policy configuration are required before claiming that stronger security property. Wallet recovery must be exercised separately; this code includes export, not an independently verified recovery guarantee.
-- A DB superuser can change the database despite application-level immutability; use access separation and external audit retention in production.
-- RPC availability, devnet resets, faucet supply and free-service quotas can interrupt this prototype. A cron interval is eventual recovery, not a settlement SLA. The reconciliation batch is intentionally capped at 12 payments.
-- Web UI integration is implemented; there is no React Native build in this source package. A native client would share the API and use Privy's React Native SDK for signing.
-- This demo's public system view intentionally publishes pseudonymous wallet/payment data. Replace its access policy before using personal data.
-- Server keys only control the sponsor/test treasury. They must contain devnet-only keys and stay outside source control. The network genesis guard refuses mainnet.
+## Scope and operational notes
 
-## References
+- **Devnet only.** The network guard rejects mainnet. Sponsor and treasury keys must be dedicated test keys.
+- **Application payments only.** Reconciliation tracks transfers and faucet grants created here. External deposits can change the observed balance without generating an application receipt or ledger entry.
+- **Wallet security.** User private keys are not stored in the application database, and the backend has no delegated user-wallet signer. Supabase JWT authentication remains an identity trust root. Recovery, MFA and provider policies need separate review before a production launch. Wallet export uses Privy's UI.
+- **Public test data.** The system view exposes usernames, wallet addresses and payment activity. Messages and credentials are excluded. Production deployments would need a different access policy.
+- **Prototype limits.** There are no bank rails, KYC/KYB, cards, Token-2022 issuance or React Native client in this repository. Synthetic email aliases do not support email recovery. The application has not undergone an independent security audit.
+- **Operations.** Reconciliation handles up to 12 pending payments per batch. Devnet availability, provider quotas and treasury funding affect service availability. Database immutability rules do not protect against a database superuser.
 
-- https://docs.privy.io/recipes/authentication/using-supabase-for-custom-auth
-- https://docs.privy.io/authentication/user-authentication/jwt-based-auth/usage
-- https://docs.privy.io/wallets/using-wallets/solana/sign-a-transaction
-- https://solana.com/docs/references/clusters
-- https://developers.circle.com/stablecoins/quickstart-transfer-10-usdc-on-solana
-- https://www.helius.dev/docs/webhooks
-- https://supabase.com/docs/guides/functions/schedule-functions
-- https://vercel.com/docs/functions/configuring-functions/duration
-#   i h s a n - p a y  
- 
+## Documentation
+
+- [Setup guide](KURULUM.tr.md)
+- [Validation record](docs/VALIDATION.md)
+- [Design notes](docs/design.md)
+
+## Provider references
+
+- [Privy: Supabase custom authentication](https://docs.privy.io/recipes/authentication/using-supabase-for-custom-auth)
+- [Privy: Solana transaction signing](https://docs.privy.io/wallets/using-wallets/solana/sign-a-transaction)
+- [Solana clusters](https://solana.com/docs/references/clusters)
+- [Circle: test USDC on Solana](https://developers.circle.com/stablecoins/quickstart-transfer-10-usdc-on-solana)
+- [Helius webhooks](https://www.helius.dev/docs/webhooks)
+- [Supabase scheduled functions](https://supabase.com/docs/guides/functions/schedule-functions)
